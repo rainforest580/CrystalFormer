@@ -4,7 +4,9 @@ from functools import partial
 
 from crystalformer.src.von_mises import sample_von_mises
 from crystalformer.src.lattice import symmetrize_lattice
-from crystalformer.src.wyckoff import mult_table, symops
+import numpy as np
+
+from crystalformer.src.wyckoff import mult_table, dof0_table, symops
 
 def project_xyz(g, w, x, idx):
     '''
@@ -55,18 +57,115 @@ def sample_x(key, h_x, Kx, top_p, temperature, batchsize):
     k = sample_top_p(key_k, x_logit, top_p, temperature)
     loc = loc.reshape(batchsize, Kx)[jnp.arange(batchsize), k]
     kappa = kappa.reshape(batchsize, Kx)[jnp.arange(batchsize), k]
-    kappa = jnp.clip(kappa, a_min=1e-6)  # to avoid numerical issue
+    kappa = jnp.clip(kappa, min=1e-6)  # to avoid numerical issue
     x = sample_von_mises(key_x, loc, kappa/temperature, (batchsize,))
     x = (x+ jnp.pi)/(2.0*jnp.pi) # wrap into [0, 1]
     return key, x 
 
 
-def make_sample_crystal(transformer, n_max, atom_types, wyck_types, Kx, Kl, w_mask, top_p, temperature, K=0, g=None, atom_mask=None, spg_mask=None):
+def _reachable_from_letter(g, wyck_types, k_max):
+    mult = np.asarray(mult_table[g-1])[:wyck_types]
+    dof0 = np.asarray(dof0_table[g-1])[:wyck_types]
+    table = np.zeros((wyck_types + 1, k_max + 1), dtype=bool)
+    table[wyck_types, 0] = True
+    for w in range(wyck_types - 1, 0, -1):
+        base = table[w + 1].copy()
+        m = int(mult[w])
+        if m > 0:
+            for k in range(m, k_max + 1):
+                if dof0[w]:
+                    base[k] |= table[w + 1, k - m]
+                else:
+                    base[k] |= base[k - m]
+        table[w] = base
+    table[0] = table[1]
+    return jnp.array(table)
+
+
+def _joint_fill_table(g, wyck_types, counts_k, max_cells=2e8, forbidden_k=frozenset()):
+    mult = np.asarray(mult_table[g-1])[:wyck_types]
+    dof0 = np.asarray(dof0_table[g-1])[:wyck_types]
+    dims = tuple(int(c) + 1 for c in counts_k)
+    n = int(np.prod(dims))
+    if n * (wyck_types + 1) > max_cells:
+        return None
+    table = np.zeros((wyck_types + 1,) + dims, dtype=bool)
+    table[(wyck_types,) + (0,) * len(dims)] = True
+    for w in range(wyck_types - 1, 0, -1):
+        nxt = table[w + 1]
+        cur = nxt.copy()
+        m = int(mult[w])
+        if m > 0:
+            for ax, c in enumerate(dims):
+                if c - 1 < m or (ax, w) in forbidden_k:
+                    continue
+                src = nxt if dof0[w] else cur
+                for r in range(m, c):
+                    sl_dst = [slice(None)] * len(dims); sl_dst[ax] = r
+                    sl_src = [slice(None)] * len(dims); sl_src[ax] = r - m
+                    if dof0[w]:
+                        cur[tuple(sl_dst)] |= src[tuple(sl_src)]
+                    else:
+                        cur[tuple(sl_dst)] |= cur[tuple(sl_src)]
+        table[w] = cur
+    table[0] = table[1]
+    return jnp.array(table.reshape(wyck_types + 1, n))
+
+
+def make_sample_crystal(transformer, n_max, atom_types, wyck_types, Kx, Kl, w_mask, top_p, temperature, K=0, g=None, atom_mask=None, spg_mask=None, atom_counts=None, forbidden_sites=()):
 
     if atom_mask is None:
         user_atom_mask = jnp.ones((atom_types,), dtype=bool)
     else:
         user_atom_mask = atom_mask.astype(bool)
+
+    hard = atom_counts is not None
+    if hard:
+        assert g is not None, "atom_counts requires a fixed space group"
+        counts = jnp.asarray(atom_counts, dtype=int)
+        k_max = int(np.max(np.asarray(counts)))
+        reach = _reachable_from_letter(g, wyck_types, k_max)
+        mult_row = mult_table[g-1][:wyck_types]
+        dof0_row = dof0_table[g-1][:wyck_types]
+        atom_ids = jnp.arange(atom_types)
+        wyck_ids = jnp.arange(wyck_types)
+        next_lo = wyck_ids + dof0_row.astype(int)
+        el_ids = np.nonzero(np.asarray(counts))[0]
+        el_pos = {int(z): k for k, z in enumerate(el_ids)}
+        forbidden_k = frozenset((el_pos[int(z)], int(w)) for z, w in forbidden_sites if int(z) in el_pos)
+        joint = _joint_fill_table(g, wyck_types, np.asarray(counts)[el_ids], forbidden_k=forbidden_k)
+        forbid_mask = np.zeros((wyck_types, atom_types), dtype=bool)
+        for z, w in forbidden_sites:
+            forbid_mask[int(w), int(z)] = True
+        forbid_mask = jnp.array(forbid_mask)
+        if joint is not None:
+            el_ids_j = jnp.array(el_ids)
+            dims = np.asarray(counts)[el_ids] + 1
+            strides = jnp.array(np.concatenate([np.cumprod(dims[::-1])[::-1][1:], [1]]).astype(int))
+            n_cells = int(np.prod(dims))
+
+        def pair_ok_joint(R, lo):
+            r = R[:, el_ids_j]
+            flat = (r * strides[None, :]).sum(axis=1)
+            m = mult_row[None, :, None]
+            new_idx = flat[:, None, None] - m * strides[None, None, :]
+            ok = (m > 0) & (r[:, None, :] >= m)
+            ok = ok & joint[next_lo[None, :, None], jnp.clip(new_idx, 0, n_cells - 1)]
+            ok = ok & (wyck_ids[None, :] >= lo[:, None])[:, :, None]
+            full = jnp.zeros((R.shape[0], wyck_types, atom_types), dtype=bool)
+            return full.at[:, :, el_ids_j].set(ok)
+
+        def pair_ok(R, lo):
+            m = mult_row[None, :, None]
+            rem = R[:, None, :] - m
+            nxt = next_lo[None, :, None]
+            ok = (m > 0) & (rem >= 0) & reach[nxt, jnp.clip(rem, 0, k_max)]
+            ok = ok & (wyck_ids[None, :] >= lo[:, None])[:, :, None]
+            ok = ok & (atom_ids > 0)[None, None, :]
+            fill = reach[nxt, jnp.clip(R[:, None, :], 0, k_max)]
+            n_bad = jnp.sum(~fill, axis=2, keepdims=True)
+            ok = ok & ((n_bad - (~fill).astype(int)) == 0)
+            return ok
 
     @partial(jax.jit, static_argnums=2)
     def sample_crystal(key, params, batchsize, composition):
@@ -80,11 +179,20 @@ def make_sample_crystal(transformer, n_max, atom_types, wyck_types, Kx, Kl, w_ma
         atom_mask = atom_mask.at[0].set(True) # padding atom always allowed
            
         def body_fn(i, state):
-            key, W, A, X, Y, Z, L = state 
+            key, W, A, X, Y, Z, L, R, U = state 
 
             # (1) W 
             w_logit = inference(transformer, params, composition, G, W, A, X, Y, Z)[1][:, 5*i] # (batchsize, output_size)
             w_logit = w_logit[:, :wyck_types]
+            if hard:
+                ok = pair_ok_joint(R, U) if joint is not None else pair_ok(R, U)
+                ok = ok & ~forbid_mask[None, :, :]
+                w_ok = ok.any(axis=2)
+                done = R.sum(axis=1) == 0
+                dead = ~done & ~w_ok.any(axis=1)
+                w_ok = w_ok.at[:, 0].set(done | dead)
+                w_ok = jnp.where(done[:, None], (wyck_ids == 0)[None, :], w_ok)
+                w_logit = w_logit + jnp.where(w_ok, 0.0, -1e10)
         
             key, subkey = jax.random.split(key)
             w = sample_top_p(subkey, w_logit, top_p, temperature)
@@ -99,8 +207,15 @@ def make_sample_crystal(transformer, n_max, atom_types, wyck_types, Kx, Kl, w_ma
         
             key, subkey = jax.random.split(key)
             a_logit = a_logit + jnp.where(atom_mask, 0.0, -1e10) # enhance the probability of masked atoms (do not need to normalize since we only use it for sampling, not computing logp)
+            if hard:
+                a_ok = ok[jnp.arange(batchsize), w, :]
+                a_ok = jnp.where((w == 0)[:, None], (atom_ids == 0)[None, :], a_ok)
+                a_logit = a_logit + jnp.where(a_ok, 0.0, -1e10)
             a = sample_top_p(subkey, a_logit, top_p, temperature)
             A = A.at[:, i].set(a)
+            if hard:
+                R = R - jax.nn.one_hot(a, atom_types, dtype=int) * mult_row[w][:, None]
+                U = jnp.where(w > 0, next_lo[w], U)
         
             lattice_params = h_al[:, atom_types:atom_types+Kl+2*6*Kl]
             L = L.at[:, i].set(lattice_params)
@@ -144,7 +259,7 @@ def make_sample_crystal(transformer, n_max, atom_types, wyck_types, Kx, Kl, w_ma
             z = xyz[:, 2]
             Z = Z.at[:, i].set(z)
 
-            return key, W, A, X, Y, Z, L
+            return key, W, A, X, Y, Z, L, R, U
             
         # we waste computation time by always working with the maximum length sequence, but we save compilation time
         G = jnp.zeros((batchsize,), dtype=int)
@@ -179,7 +294,9 @@ def make_sample_crystal(transformer, n_max, atom_types, wyck_types, Kx, Kl, w_ma
         else: # one has specified the space group
             G = jnp.zeros((batchsize,), dtype=int) + g
 
-        key, W, A, X, Y, Z, L = jax.lax.fori_loop(0, n_max, body_fn, (key, W, A, X, Y, Z, L))
+        R = jnp.tile(counts, (batchsize, 1)) if hard else jnp.zeros((batchsize, atom_types), dtype=int)
+        U = jnp.ones((batchsize,), dtype=int)
+        key, W, A, X, Y, Z, L, R, U = jax.lax.fori_loop(0, n_max, body_fn, (key, W, A, X, Y, Z, L, R, U))
 
         @jax.vmap
         def lookup(g, w):

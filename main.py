@@ -67,6 +67,8 @@ group = parser.add_argument_group('sampling parameters')
 group.add_argument('--seed', type=int, default=None, help='random seed to sample')
 group.add_argument('--wyckoff', type=str, default=None, nargs='+', help='The Wyckoff positions to be sampled, e.g. a, b')
 group.add_argument('--formula', type=str, default=None, help='chemical formula of the compound')
+group.add_argument('--forbid_sites', type=str, default=None, help='comma-separated element:letter pairs that may not be used together (e.g. Mn:c); requires --atom_counts')
+group.add_argument('--atom_counts', type=str, default=None, help='exact atom counts per conventional cell (e.g. Ba3V6Zn9H6O30); enforced as a hard constraint during sampling, requires --spacegroup')
 group.add_argument('--top_p', type=float, default=1.0, help='1.0 means un-modified logits, smaller value of p give give less diverse samples')
 group.add_argument('--temperature', type=float, default=1.0, help='temperature used for sampling')
 group.add_argument('--K', type=int, default=30, help='top K number of space groups. 0 means we sample spacegroup')
@@ -205,7 +207,14 @@ else:
     else:
         print ('targeting spacegroup No.', args.spacegroup)
 
-    sample_crystal = make_sample_crystal(transformer, args.n_max, args.atom_types, args.wyck_types, args.Kx, args.Kl, w_mask, args.top_p, args.temperature, args.K, args.spacegroup, atom_mask)
+    atom_counts = None if args.atom_counts is None else formula_string_to_composition_vector(args.atom_counts)
+    forbidden_sites = []
+    if args.forbid_sites:
+        from crystalformer.src.elements import element_dict
+        for item in args.forbid_sites.split(','):
+            el, letter = item.strip().split(':')
+            forbidden_sites.append((element_dict[el], ord(letter) - ord('a') + 1))
+    sample_crystal = make_sample_crystal(transformer, args.n_max, args.atom_types, args.wyck_types, args.Kx, args.Kl, w_mask, args.top_p, args.temperature, args.K, args.spacegroup, atom_mask, atom_counts=atom_counts, forbidden_sites=forbidden_sites)
 
     if args.seed is not None:
         key = jax.random.PRNGKey(args.seed) # reset key for sampling if seed is provided
