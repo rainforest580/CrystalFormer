@@ -3,10 +3,10 @@
 > **Changes**
 >
 > - `--atom_counts FORMULA` (requires `--spacegroup`): the exact atom counts of the conventional cell, e.g. `Ag16Mo8O32`, enforced as a hard constraint while sampling. At every Wyckoff step, letters and elements whose multiplicities can no longer complete the remaining counts are masked out, so every sample has exactly the given composition. The check uses a reachability table over the Wyckoff letters of the space group (a joint table over all elements when it fits in memory).
-> - `--forbid_sites EL:LETTER[,EL:LETTER...]` (requires `--atom_counts`): element–Wyckoff-letter pairs that may not be used, e.g. `Mn:c`.
+> - `--forbid_sites EL:LETTER[,EL:LETTER...]` (experimental, requires `--atom_counts`): specify element–Wyckoff-letter pairs that may not be used, e.g. `Mn:c`.
 > - `jnp.clip(..., a_min=...)` → `jnp.clip(..., min=...)`, the keyword newer JAX accepts.
 >
-> The code changes are in `main.py` and `crystalformer/src/sample.py`. Without the two new options, sampling behaves as upstream.
+> The code changes are in `main.py` and `crystalformer/src/sample.py`.
 >
 > **Example**
 >
